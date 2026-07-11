@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
@@ -77,21 +78,26 @@ type portRouter struct {
 	cancel   context.CancelFunc
 }
 
+type udpRelayKey struct {
+	serviceID types.ServiceID
+	port      uint16
+}
+
 type Server struct {
 	ctx               context.Context
-	mgmtClient    proto.ProxyServiceClient
-	proxy         *proxy.ReverseProxy
-	netbird       *roundtrip.NetBird
-	acme          *acme.Manager
+	mgmtClient        proto.ProxyServiceClient
+	proxy             *proxy.ReverseProxy
+	netbird           *roundtrip.NetBird
+	acme              *acme.Manager
 	staticCertWatcher *certwatch.Watcher
-	auth          *auth.Middleware
-	http          *http.Server
-	https         *http.Server
-	debug         *http.Server
-	healthServer  *health.Server
-	healthChecker *health.Checker
-	meter         *proxymetrics.Metrics
-	accessLog     *accesslog.Logger
+	auth              *auth.Middleware
+	http              *http.Server
+	https             *http.Server
+	debug             *http.Server
+	healthServer      *health.Server
+	healthChecker     *health.Checker
+	meter             *proxymetrics.Metrics
+	accessLog         *accesslog.Logger
 	// middlewareManager drives per-target middleware dispatch. Always
 	// constructed during boot; an empty registry produces empty chains and
 	// the reverse-proxy stays on the no-capture fast path.
@@ -99,16 +105,16 @@ type Server struct {
 	// middlewareRegistry is the source of registered middleware factories.
 	// Concrete middlewares register themselves through init().
 	middlewareRegistry *middleware.Registry
-	mainRouter    *nbtcp.Router
-	mainPort      uint16
-	udpMu         sync.Mutex
-	udpRelays     map[types.ServiceID]*udprelay.Relay
-	udpRelayWg    sync.WaitGroup
-	portMu        sync.RWMutex
-	portRouters   map[uint16]*portRouter
-	svcPorts      map[types.ServiceID][]uint16
-	lastMappings  map[types.ServiceID]*proto.ProxyMapping
-	portRouterWg  sync.WaitGroup
+	mainRouter         *nbtcp.Router
+	mainPort           uint16
+	udpMu              sync.Mutex
+	udpRelays          map[udpRelayKey]*udprelay.Relay
+	udpRelayWg         sync.WaitGroup
+	portMu             sync.RWMutex
+	portRouters        map[uint16]*portRouter
+	svcPorts           map[types.ServiceID][]uint16
+	lastMappings       map[types.ServiceID]*proto.ProxyMapping
+	portRouterWg       sync.WaitGroup
 
 	// hijackTracker tracks hijacked connections (e.g. WebSocket upgrades)
 	// so they can be closed during graceful shutdown, since http.Server.Shutdown
@@ -131,6 +137,9 @@ type Server struct {
 
 	// removePeer defaults to netbird.RemovePeer; overridable in tests.
 	removePeer func(ctx context.Context, accountID types.AccountID, key roundtrip.ServiceKey) error
+	// dialResolver defaults to the embedded NetBird client; tests can replace it
+	// to exercise listener/relay lifecycle without creating a tunnel.
+	dialResolver func(accountID types.AccountID) (types.DialContextFunc, error)
 
 	// inbound, when non-nil, manages per-account inbound listeners. Set by
 	// initPrivateInbound only when Private is true so the standalone
@@ -533,7 +542,7 @@ func (s *Server) initLifecycleState() {
 	s.initDefaults()
 	s.routerReady = make(chan struct{})
 	s.runErrCh = make(chan struct{})
-	s.udpRelays = make(map[types.ServiceID]*udprelay.Relay)
+	s.udpRelays = make(map[udpRelayKey]*udprelay.Relay)
 	s.portRouters = make(map[uint16]*portRouter)
 	s.svcPorts = make(map[types.ServiceID][]uint16)
 	s.lastMappings = make(map[types.ServiceID]*proto.ProxyMapping)
@@ -1050,6 +1059,9 @@ func (s *Server) shutdownCrowdSec() {
 // resolveDialFunc returns a DialContextFunc that dials through the
 // NetBird tunnel for the given account.
 func (s *Server) resolveDialFunc(accountID types.AccountID) (types.DialContextFunc, error) {
+	if s.dialResolver != nil {
+		return s.dialResolver(accountID)
+	}
 	client, ok := s.netbird.GetClient(accountID)
 	if !ok {
 		return nil, fmt.Errorf("no client for account %s", accountID)
@@ -1278,12 +1290,14 @@ func (s *Server) proxyCapabilities() *proto.ProxyCapabilities {
 	privateCapability := s.Private
 	// Always true: this build enforces ProxyMapping.private via the auth middleware.
 	supportsPrivateService := true
+	supportsPortMappings := true
 	return &proto.ProxyCapabilities{
 		SupportsCustomPorts:    &s.SupportsCustomPorts,
 		RequireSubdomain:       &s.RequireSubdomain,
 		SupportsCrowdsec:       &supportsCrowdSec,
 		Private:                &privateCapability,
 		SupportsPrivateService: &supportsPrivateService,
+		SupportsPortMappings:   &supportsPortMappings,
 	}
 }
 
@@ -1634,9 +1648,7 @@ func (s *Server) addMapping(ctx context.Context, mapping *proto.ProxyMapping) er
 func (s *Server) modifyMapping(ctx context.Context, mapping *proto.ProxyMapping) error {
 	if old := s.loadMapping(types.ServiceID(mapping.GetId())); old != nil {
 		s.cleanupMappingRoutes(old)
-		if mode := types.ServiceMode(old.GetMode()); mode.IsL4() {
-			s.meter.L4ServiceRemoved(mode)
-		}
+		s.removeMappingL4Metrics(old)
 	} else {
 		s.cleanupMappingRoutes(mapping)
 	}
@@ -1651,6 +1663,9 @@ func (s *Server) modifyMapping(ctx context.Context, mapping *proto.ProxyMapping)
 // setupMappingRoutes configures the appropriate routes or relays for the given
 // service mapping based on its mode. The NetBird peer must already exist.
 func (s *Server) setupMappingRoutes(ctx context.Context, mapping *proto.ProxyMapping) error {
+	if len(mapping.GetPortMappings()) > 0 {
+		return s.setupPortMappings(ctx, mapping)
+	}
 	switch types.ServiceMode(mapping.GetMode()) {
 	case types.ServiceModeTCP:
 		return s.setupTCPMapping(ctx, mapping)
@@ -1661,6 +1676,138 @@ func (s *Server) setupMappingRoutes(ctx context.Context, mapping *proto.ProxyMap
 	default:
 		return s.setupHTTPMapping(ctx, mapping)
 	}
+}
+
+func (s *Server) removeMappingL4Metrics(mapping *proto.ProxyMapping) {
+	if len(mapping.GetPortMappings()) == 0 {
+		if mode := types.ServiceMode(mapping.GetMode()); mode.IsL4() {
+			s.meter.L4ServiceRemoved(mode)
+		}
+		return
+	}
+	for _, portMapping := range mapping.GetPortMappings() {
+		if portMapping == nil || portMapping.GetListenPortEnd() < portMapping.GetListenPortStart() {
+			continue
+		}
+		mode := types.ServiceMode(portMapping.GetProtocol())
+		if !mode.IsL4() {
+			continue
+		}
+		for port := portMapping.GetListenPortStart(); port <= portMapping.GetListenPortEnd(); port++ {
+			s.meter.L4ServiceRemoved(mode)
+			if port == 65535 {
+				break
+			}
+		}
+	}
+}
+
+// setupPortMappings expands each inclusive range into the existing, well-tested
+// single-port setup paths. Every child keeps the parent service ID so cleanup
+// and in-place updates remain service-scoped and retain the embedded NetBird
+// peer.
+func (s *Server) setupPortMappings(ctx context.Context, mapping *proto.ProxyMapping) error {
+	targetAddress := s.l4TargetAddress(mapping)
+	if targetAddress == "" {
+		return fmt.Errorf("empty target address for multi-port service %s", mapping.GetId())
+	}
+	targetHost, _, err := net.SplitHostPort(targetAddress)
+	if err != nil {
+		return fmt.Errorf("split target address for multi-port service %s: %w", mapping.GetId(), err)
+	}
+
+	type listenerKey struct {
+		protocol string
+		port     uint16
+	}
+	seen := make(map[listenerKey]struct{})
+	addedModes := make([]types.ServiceMode, 0)
+	rollbackMetrics := func() {
+		for _, mode := range addedModes {
+			s.meter.L4ServiceRemoved(mode)
+		}
+	}
+
+	for i, portMapping := range mapping.GetPortMappings() {
+		listenStart, listenEnd, targetStart, err := validateWirePortMapping(i, portMapping)
+		if err != nil {
+			rollbackMetrics()
+			return err
+		}
+		mode := types.ServiceMode(portMapping.GetProtocol())
+		for offset := uint32(0); offset <= uint32(listenEnd-listenStart); offset++ {
+			listenPort := uint16(uint32(listenStart) + offset) //nolint:gosec // range validated as uint16
+			targetPort := uint16(uint32(targetStart) + offset) //nolint:gosec // equal-sized range validated as uint16
+			key := listenerKey{protocol: portMapping.GetProtocol(), port: listenPort}
+			if _, ok := seen[key]; ok {
+				rollbackMetrics()
+				return fmt.Errorf("port_mappings[%d] duplicates %s listener port %d", i, key.protocol, key.port)
+			}
+			seen[key] = struct{}{}
+
+			child := singlePortMapping(mapping, portMapping.GetProtocol(), targetHost, listenPort, targetPort)
+			switch mode {
+			case types.ServiceModeTCP:
+				err = s.setupTCPMapping(ctx, child)
+			case types.ServiceModeUDP:
+				err = s.setupUDPMapping(ctx, child)
+			case types.ServiceModeTLS:
+				err = s.setupTLSMapping(ctx, child)
+			default:
+				err = fmt.Errorf("port_mappings[%d] has unsupported protocol %q", i, portMapping.GetProtocol())
+			}
+			if err != nil {
+				rollbackMetrics()
+				return fmt.Errorf("apply port_mappings[%d] listener %d: %w", i, listenPort, err)
+			}
+			addedModes = append(addedModes, mode)
+		}
+	}
+	return nil
+}
+
+func validateWirePortMapping(index int, mapping *proto.ServicePortMapping) (uint16, uint16, uint16, error) {
+	if mapping == nil {
+		return 0, 0, 0, fmt.Errorf("port_mappings[%d] must not be nil", index)
+	}
+	values := []struct {
+		name  string
+		value uint32
+	}{
+		{name: "listen_port_start", value: mapping.GetListenPortStart()},
+		{name: "listen_port_end", value: mapping.GetListenPortEnd()},
+		{name: "target_port_start", value: mapping.GetTargetPortStart()},
+		{name: "target_port_end", value: mapping.GetTargetPortEnd()},
+	}
+	for _, value := range values {
+		if value.value == 0 || value.value > 65535 {
+			return 0, 0, 0, fmt.Errorf("port_mappings[%d].%s must be between 1 and 65535, got %d", index, value.name, value.value)
+		}
+	}
+	if mapping.GetListenPortStart() > mapping.GetListenPortEnd() {
+		return 0, 0, 0, fmt.Errorf("port_mappings[%d] listener range is reversed", index)
+	}
+	if mapping.GetTargetPortStart() > mapping.GetTargetPortEnd() {
+		return 0, 0, 0, fmt.Errorf("port_mappings[%d] target range is reversed", index)
+	}
+	if mapping.GetListenPortEnd()-mapping.GetListenPortStart() != mapping.GetTargetPortEnd()-mapping.GetTargetPortStart() {
+		return 0, 0, 0, fmt.Errorf("port_mappings[%d] listener and target ranges must contain the same number of ports", index)
+	}
+	return uint16(mapping.GetListenPortStart()), //nolint:gosec // bounds checked above
+		uint16(mapping.GetListenPortEnd()), //nolint:gosec // bounds checked above
+		uint16(mapping.GetTargetPortStart()), //nolint:gosec // bounds checked above
+		nil
+}
+
+func singlePortMapping(parent *proto.ProxyMapping, protocol, targetHost string, listenPort, targetPort uint16) *proto.ProxyMapping {
+	child := goproto.Clone(parent).(*proto.ProxyMapping)
+	child.PortMappings = nil
+	child.Mode = protocol
+	child.ListenPort = int32(listenPort)
+	if len(child.Path) > 0 {
+		child.Path[0].Target = net.JoinHostPort(targetHost, strconv.FormatUint(uint64(targetPort), 10))
+	}
+	return child
 }
 
 // setupHTTPMapping configures HTTP reverse proxy, auth, and ACME routes.
@@ -1762,9 +1909,7 @@ func (s *Server) setupTCPMapping(ctx context.Context, mapping *proto.ProxyMappin
 		Filter:             s.parseRestrictions(mapping),
 	})
 
-	s.portMu.Lock()
-	s.svcPorts[svcID] = []uint16{port}
-	s.portMu.Unlock()
+	s.trackServicePort(svcID, port)
 
 	s.meter.L4ServiceAdded(types.ServiceModeTCP)
 	s.sendStatusUpdate(ctx, accountID, svcID, proto.ProxyStatus_PROXY_STATUS_ACTIVE, nil)
@@ -1845,9 +1990,7 @@ func (s *Server) setupTLSMapping(ctx context.Context, mapping *proto.ProxyMappin
 	})
 
 	if tlsPort != s.mainPort {
-		s.portMu.Lock()
-		s.svcPorts[svcID] = []uint16{tlsPort}
-		s.portMu.Unlock()
+		s.trackServicePort(svcID, tlsPort)
 	}
 
 	s.Logger.WithFields(log.Fields{
@@ -1862,15 +2005,26 @@ func (s *Server) setupTLSMapping(ctx context.Context, mapping *proto.ProxyMappin
 	return nil
 }
 
-// serviceKeyForMapping returns the appropriate ServiceKey for a mapping.
-// TCP/UDP use an ID-based key; HTTP/TLS use a domain-based key.
-func (s *Server) serviceKeyForMapping(mapping *proto.ProxyMapping) roundtrip.ServiceKey {
-	switch types.ServiceMode(mapping.GetMode()) {
-	case types.ServiceModeTCP, types.ServiceModeUDP:
-		return roundtrip.L4ServiceKey(types.ServiceID(mapping.GetId()))
-	default:
-		return roundtrip.DomainServiceKey(mapping.GetDomain())
+func (s *Server) trackServicePort(svcID types.ServiceID, port uint16) {
+	s.portMu.Lock()
+	defer s.portMu.Unlock()
+	for _, existing := range s.svcPorts[svcID] {
+		if existing == port {
+			return
+		}
 	}
+	s.svcPorts[svcID] = append(s.svcPorts[svcID], port)
+}
+
+// serviceKeyForMapping returns the appropriate ServiceKey for a mapping.
+// Every L4 mode uses the stable service ID so adding/removing/reordering port
+// mappings cannot change the embedded-client registration key. HTTP remains
+// domain-based because its route lifecycle follows domain changes.
+func (s *Server) serviceKeyForMapping(mapping *proto.ProxyMapping) roundtrip.ServiceKey {
+	if len(mapping.GetPortMappings()) > 0 || types.ServiceMode(mapping.GetMode()).IsL4() {
+		return roundtrip.L4ServiceKey(types.ServiceID(mapping.GetId()))
+	}
+	return roundtrip.DomainServiceKey(mapping.GetDomain())
 }
 
 // parseRestrictions converts a proto mapping's access restrictions into
@@ -1994,13 +2148,14 @@ func l4SessionIdleTimeout(mapping *proto.ProxyMapping) time.Duration {
 func (s *Server) addUDPRelay(ctx context.Context, mapping *proto.ProxyMapping, targetAddress string, listenPort uint16) error {
 	svcID := types.ServiceID(mapping.GetId())
 	accountID := types.AccountID(mapping.GetAccountId())
+	key := udpRelayKey{serviceID: svcID, port: listenPort}
 
 	if s.WireguardPort != 0 && listenPort == s.WireguardPort {
 		return fmt.Errorf("UDP port %d conflicts with tunnel port", listenPort)
 	}
 
 	// Close existing relay if present (idempotent re-add).
-	s.removeUDPRelay(svcID)
+	s.removeUDPRelay(key)
 
 	listenAddr := fmt.Sprintf(":%d", listenPort)
 
@@ -2040,7 +2195,7 @@ func (s *Server) addUDPRelay(ctx context.Context, mapping *proto.ProxyMapping, t
 	relay.SetObserver(s.meter)
 
 	s.udpMu.Lock()
-	s.udpRelays[svcID] = relay
+	s.udpRelays[key] = relay
 	s.udpMu.Unlock()
 
 	s.udpRelayWg.Go(relay.Serve)
@@ -2189,9 +2344,7 @@ func (s *Server) removeMapping(ctx context.Context, mapping *proto.ProxyMapping)
 
 	if old := s.deleteMapping(types.ServiceID(mapping.GetId())); old != nil {
 		s.cleanupMappingRoutes(old)
-		if mode := types.ServiceMode(old.GetMode()); mode.IsL4() {
-			s.meter.L4ServiceRemoved(mode)
-		}
+		s.removeMappingL4Metrics(old)
 	} else {
 		s.cleanupMappingRoutes(mapping)
 	}
@@ -2237,33 +2390,59 @@ func (s *Server) cleanupMappingRoutes(mapping *proto.ProxyMapping) {
 		if router := s.routerForPortExisting(entry); router != nil {
 			if host != "" {
 				router.RemoveRoute(nbtcp.SNIHost(host), svcID)
-			} else {
-				router.RemoveFallback(svcID)
 			}
+			// Raw TCP uses a fallback even though its management domain is
+			// non-empty; TLS uses an SNI route. Removing both is idempotent and
+			// correctly handles a service containing both mapping protocols.
+			router.RemoveFallback(svcID)
 		}
 		s.cleanupPortIfEmpty(entry)
 	}
 
 	// UDP relay cleanup (idempotent).
-	s.removeUDPRelay(svcID)
+	s.removeUDPRelays(svcID)
 
 	// Release CrowdSec after all routes are removed so the shared bouncer
 	// isn't stopped while stale filters can still be reached by in-flight requests.
 	s.releaseCrowdSec(svcID)
 }
 
-// removeUDPRelay stops and removes a UDP relay by service ID.
-func (s *Server) removeUDPRelay(svcID types.ServiceID) {
+// removeUDPRelay stops and removes one UDP relay.
+func (s *Server) removeUDPRelay(key udpRelayKey) {
 	s.udpMu.Lock()
-	relay, ok := s.udpRelays[svcID]
+	relay, ok := s.udpRelays[key]
 	if ok {
-		delete(s.udpRelays, svcID)
+		delete(s.udpRelays, key)
 	}
 	s.udpMu.Unlock()
 
 	if ok {
 		relay.Close()
-		s.Logger.WithField("service_id", svcID).Info("UDP relay removed")
+		s.Logger.WithFields(log.Fields{"service_id": key.serviceID, "port": key.port}).Info("UDP relay removed")
+	}
+}
+
+func (s *Server) removeUDPRelays(svcID types.ServiceID) {
+	s.udpMu.Lock()
+	relays := make([]struct {
+		key   udpRelayKey
+		relay *udprelay.Relay
+	}, 0)
+	for key, relay := range s.udpRelays {
+		if key.serviceID != svcID {
+			continue
+		}
+		relays = append(relays, struct {
+			key   udpRelayKey
+			relay *udprelay.Relay
+		}{key: key, relay: relay})
+		delete(s.udpRelays, key)
+	}
+	s.udpMu.Unlock()
+
+	for _, item := range relays {
+		item.relay.Close()
+		s.Logger.WithFields(log.Fields{"service_id": item.key.serviceID, "port": item.key.port}).Info("UDP relay removed")
 	}
 }
 

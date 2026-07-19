@@ -1,0 +1,12 @@
+# Copy to docker-compose.override.yml beside the docker-compose.yml generated
+# by getting-started.sh. Publish only the listeners that services actually use.
+services:
+  proxy:
+    ports:
+      - "8080:8080/tcp"
+      - "9000:9000/tcp"
+      - "9001:9001/udp"
+      - "5000-5030:5000-5030/udp"
+
+      # TCP and UDP can share a numeric port when listed separately:
+      # - "9001:9001/tcp"

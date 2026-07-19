@@ -5,6 +5,12 @@ This document records the reverse-proxy architecture before implementing
 It describes the NetBird repository at `8e02154bf` and the separately maintained
 dashboard repository at `58d1035`.
 
+The baseline and local-E2E sections below are historical evidence from the
+original implementation branch. The focused multi-port branch intentionally
+does not carry the former broad `dev/local` integration stack. Use
+[`multiport-vps-trial.md`](multiport-vps-trial.md) for the current image build
+and clean VPS verification procedure.
+
 ## Component map
 
 The feature crosses four processes and two repositories:
